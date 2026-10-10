@@ -47,8 +47,8 @@ default("AutoPurchaseStealth",  false)
 _G.AutoRefundV2 = false
 default("Webhook",              "")
 
-local URL_WALLYLIB     = "https://raw.githubusercontent.com/phngkhaniuem/my-Ui-Library/refs/heads/main/wallylib.lua"
-local URL_NOTIFICATION = "https://raw.githubusercontent.com/phngkhaniuem/my-Ui-Library/refs/heads/main/Notification.lua"
+local URL_WALLYLIB     = "https://raw.githubusercontent.com/emaankiki/my-Ui-Library/refs/heads/main/wallylib.lua"
+local URL_NOTIFICATION = "https://raw.githubusercontent.com/emaankiki/my-Ui-Library/refs/heads/main/Notification.lua"
 
 local KIND_COLORS = {
 	info    = Color3.fromRGB(0, 170, 255),
