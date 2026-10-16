@@ -1,0 +1,1070 @@
+-- gg guy, thanks claude so much<3 
+
+_G.AutoPurchaseDebug = true
+local cloneref = cloneref or function(x) return x end
+local Players            = cloneref(game:GetService("Players"))
+local StarterGui         = cloneref(game:GetService("StarterGui"))
+local MarketplaceService = cloneref(game:GetService("MarketplaceService"))
+local HttpService        = cloneref(game:GetService("HttpService"))
+local CoreGui            = cloneref(game:GetService("CoreGui"))
+local GuiService         = cloneref(game:GetService("GuiService"))
+local VirtualInputManager = cloneref(game:GetService("VirtualInputManager"))
+
+local LocalPlayer = Players.LocalPlayer
+
+local Request = http_request or request or (syn and syn.request) or (fluxus and fluxus.request) or (http and http.request)
+
+if type(getgenv().AutoRefundRuntime) == "table" and type(getgenv().AutoRefundRuntime.Destroy) == "function" then
+	pcall(getgenv().AutoRefundRuntime.Destroy)
+end
+
+local Runtime = { alive = true, connections = {}, library = nil, gui = nil }
+
+function Runtime.Destroy()
+	Runtime.alive = false
+	for _, conn in ipairs(Runtime.connections) do
+		pcall(function() conn:Disconnect() end)
+	end
+	Runtime.connections = {}
+	if Runtime.library and type(Runtime.library.Destroy) == "function" then
+		pcall(Runtime.library.Destroy, Runtime.library)
+	elseif Runtime.gui then
+		pcall(function() Runtime.gui:Destroy() end)
+	end
+	Runtime.library = nil
+	Runtime.gui = nil
+end
+
+getgenv().AutoRefundRuntime = Runtime
+
+local function default(key, value)
+	if _G[key] == nil then _G[key] = value end
+end
+
+local SETTINGS_FOLDER = "pnka"
+local SETTINGS_FILE   = SETTINGS_FOLDER .. "/promptpurchase.json"
+
+local SETTINGS = {
+	{ "Auto Refund",                  "AutoRefundV2",         "boolean" },
+	{ "Auto Purchase",                "AutoPurchase",         "boolean" },
+	{ "Item ID",                      "AutoPurchaseId",       "number"  },
+	{ "Only buy matching ID",         "AutoPurchaseFilter",   "boolean" },
+	{ "Only buy if price is 0 Robux", "AutoPurchaseFreeOnly", "boolean" },
+}
+
+local function hasFileApi()
+	return isfolder and makefolder and isfile and readfile and writefile
+end
+
+local function loadSettings()
+	if not hasFileApi() or not isfile(SETTINGS_FILE) then return end
+
+	local okRead, raw = pcall(readfile, SETTINGS_FILE)
+	if not okRead then return end
+
+	local okDecode, data = pcall(HttpService.JSONDecode, HttpService, raw)
+	if not okDecode or type(data) ~= "table" then return end
+
+	for _, entry in ipairs(SETTINGS) do
+		local value = data[entry[1]]
+		if type(value) == entry[3] and _G[entry[2]] == nil then
+			_G[entry[2]] = value
+		end
+	end
+end
+
+local function saveSettings()
+	if not hasFileApi() then return end
+
+	local data = {}
+	for _, entry in ipairs(SETTINGS) do
+		local value = _G[entry[2]]
+		if type(value) == entry[3] then
+			data[entry[1]] = value
+		end
+	end
+
+	pcall(function()
+		if not isfolder(SETTINGS_FOLDER) then makefolder(SETTINGS_FOLDER) end
+		writefile(SETTINGS_FILE, HttpService:JSONEncode(data))
+	end)
+end
+
+loadSettings()
+
+default("AutoPurchase",         false)
+default("AutoPurchaseFilter",   false)
+default("AutoPurchaseFreeOnly", false)
+default("AutoPurchaseId",       0)
+default("AutoPurchaseStealth",  false)
+default("AutoRefundV2",         false)
+default("Webhook",              "")
+
+local URL_WALLYLIB     = "https://raw.githubusercontent.com/emaankiki/my-Ui-Library/refs/heads/main/wallylib.lua"
+local URL_NOTIFICATION = "https://raw.githubusercontent.com/emaankiki/my-Ui-Library/refs/heads/main/Notification.lua"
+
+local KIND_COLORS = {
+	info    = Color3.fromRGB(0, 170, 255),
+	success = Color3.fromRGB(83, 230, 50),
+	error   = Color3.fromRGB(255, 84, 84),
+}
+
+local SKIP_MESSAGES = {
+	{ "You already own this item. Your account has not been charged.", "You already own this item", "Already Owned" },
+	{ "Your purchase of {ITEM_NAME} failed because something went wrong. Your account has not been charged. Please try again later.", "Purchase failed", "Failed" },
+	{ "This item is not currently for sale. Your account has not been charged.", "Item is not for sale", "Not For Sale" },
+	{ "You have successfully bought {ITEM_NAME}.", "Purchase completed", "Success" },
+}
+
+local currentPromptId = nil
+local itemCache       = {}
+local lastActionAt    = 0
+local preferredMethod = { buy = 1, close = 1 }
+local lastReport      = { key = nil, at = 0 }
+
+local okNotif, Notification = pcall(function()
+	return loadstring(game:HttpGet(URL_NOTIFICATION, true))()
+end)
+if not okNotif or type(Notification) ~= "table" then
+	Notification = nil
+end
+
+local function notify(title, text, kind, duration, icon)
+	local ok = Notification and pcall(function()
+		Notification:Notify(
+			{ Title = title, Description = text },
+			{
+				Type         = icon and "image" or "default",
+				Time         = duration or 3,
+				OutlineColor = KIND_COLORS[kind or "info"] or KIND_COLORS.info,
+			},
+			icon and { Image = icon, ImageColor = Color3.new(1, 1, 1) } or nil
+		)
+	end)
+	if not ok then
+		pcall(function()
+			StarterGui:SetCore("SendNotification", {
+				Title = title, Text = text, Duration = duration or 3,
+			})
+		end)
+	end
+end
+
+local lastNotified = {}
+local function notifyOnce(key, title, text, kind, duration, icon)
+	local now = os.clock()
+	if lastNotified[key] and now - lastNotified[key] < 2 then return end
+	lastNotified[key] = now
+	notify(title, text, kind, duration, icon)
+end
+
+local STATUS_KIND = {
+	["Success"]       = "success",
+	["Failed"]        = "error",
+	["Already Owned"] = "info",
+	["Not For Sale"]  = "info",
+}
+
+local reminders = {}
+
+local function remindUntil(key, message, isSatisfied, isRelevant)
+	if reminders[key] then return end
+	reminders[key] = true
+
+	task.spawn(function()
+		while Runtime.alive and isRelevant() and not isSatisfied() do
+			notify("pnka", message, "info", 3)
+			task.wait(3)
+		end
+		reminders[key] = nil
+	end)
+end
+
+local function parseItemId(text)
+	text = tostring(text or "")
+	local id = text:match("/catalog/(%d+)")
+		or text:match("/bundles/(%d+)")
+		or text:match("/library/(%d+)")
+		or text:match("/item/(%d+)")
+		or text:match("[?&]id=(%d+)")
+		or text:match("%d+")
+	return tonumber(id) or 0
+end
+
+local function cleanRichText(text)
+	text = tostring(text or "")
+	text = text:gsub("<font[^>]*>.-</font>", "R$")
+	text = text:gsub("<[^>]+>", "")
+	return (text:gsub("^%s+", ""):gsub("%s+$", ""))
+end
+
+if type(_G.AutoPurchaseId) == "string" then
+	_G.AutoPurchaseId = parseItemId(_G.AutoPurchaseId)
+end
+
+local function getOverlayItemInfo()
+	local overlay = CoreGui:FindFirstChild("FoundationOverlay")
+	local safe    = overlay and overlay:FindFirstChild("SafeAreaFrame")
+	if not safe then return nil end
+
+	local nameLabel = safe:FindFirstChild("ItemName", true)
+	local costLabel = safe:FindFirstChild("ItemCost", true)
+	if not nameLabel and not costLabel then return nil end
+
+	local price
+	if costLabel then
+		local text = cleanRichText(costLabel.Text)
+		if string.find(string.lower(text), "free", 1, true) then
+			price = 0
+		else
+			local digits = text:gsub("[^%d]", "")
+			if digits ~= "" then price = tonumber(digits) end
+		end
+	end
+
+	return { Name = nameLabel and nameLabel.Text or nil, Price = price }
+end
+
+local function calcSerial(totalQuantity, remaining)
+	totalQuantity = tonumber(totalQuantity)
+	remaining     = tonumber(remaining)
+	if totalQuantity and remaining and remaining <= totalQuantity and remaining >= 1 then
+		return totalQuantity - remaining + 1
+	end
+	return nil
+end
+
+local function fetchCatalogDetails(assetId)
+	if not Request then return nil end
+
+	local ok, res = pcall(Request, {
+		Url    = ("https://catalog.roblox.com/v1/catalog/items/%d/details?itemType=Asset"):format(assetId),
+		Method = "GET",
+	})
+	if not ok or type(res) ~= "table" then return nil end
+
+	local code = res.StatusCode or res.Status
+	if code ~= 200 or type(res.Body) ~= "string" then return nil end
+
+	local okJson, data = pcall(HttpService.JSONDecode, HttpService, res.Body)
+	if okJson and type(data) == "table" then return data end
+	return nil
+end
+
+local function getProductInfo(assetId)
+	local ok, product = pcall(function()
+		return MarketplaceService:GetProductInfo(assetId, Enum.InfoType.Asset)
+	end)
+	if not ok or not product then return nil end
+
+	local details = product.CollectibleItemDetails or product.CollectiblesItemDetails
+	local totalQuantity = details and tonumber(details.TotalQuantity)
+	local remaining     = tonumber(product.Remaining)
+
+	if _G.AutoPurchaseDebug then
+		print(("[getProductInfo] id=%s details=%s total=%s remaining=%s"):format(
+			tostring(assetId), tostring(details ~= nil), tostring(totalQuantity), tostring(remaining)))
+	end
+
+	local info = {
+		Name            = product.Name,
+		Price           = product.PriceInRobux,
+		Remaining       = product.Remaining,
+		TotalQuantity   = details and details.TotalQuantity,
+		Serial          = calcSerial(totalQuantity, remaining),
+		IsForSale       = product.IsForSale,
+		IsLimited       = product.IsLimited,
+		IsLimitedUnique = product.IsLimitedUnique,
+	}
+
+	if info.Serial == nil then
+		local data = fetchCatalogDetails(assetId)
+		if data then
+			local total = tonumber(data.totalQuantity)
+			local left  = tonumber(data.unitsAvailableForConsumption)
+
+			if total ~= nil then info.TotalQuantity = total end
+			if left  ~= nil then info.Remaining = left end
+			info.Serial = calcSerial(total, left)
+
+			if _G.AutoPurchaseDebug then
+				print(("[catalog fallback] id=%s total=%s left=%s serial=%s"):format(
+					tostring(assetId), tostring(total), tostring(left), tostring(info.Serial)))
+			end
+		elseif _G.AutoPurchaseDebug then
+			print("[catalog fallback] request failed for id=" .. tostring(assetId))
+		end
+	end
+
+	return info
+end
+
+local function loadItemInfo(assetId)
+	local info = getProductInfo(assetId) or getOverlayItemInfo() or {}
+	itemCache[assetId] = info
+	return info
+end
+
+local function formatSerial(info, missing)
+	return info.Serial ~= nil and ("#" .. tostring(info.Serial)) or missing
+end
+
+local function formatPrice(info, missing)
+	return info.Price ~= nil and tostring(info.Price) or missing
+end
+
+local function formatStock(info, missing)
+	if info.Remaining ~= nil or info.TotalQuantity ~= nil then
+		return tostring(info.Remaining ~= nil and info.Remaining or "?") .. " / " .. tostring(info.TotalQuantity ~= nil and info.TotalQuantity or "?")
+	end
+	return missing
+end
+
+local function formatLimited(info, missing)
+	if info.IsLimitedUnique == true then
+		return "Limited U"
+	elseif info.IsLimited == true then
+		return "Yes"
+	elseif info.IsLimited == false then
+		return "No"
+	end
+	return missing
+end
+
+local function formatSale(info, missing)
+	if info.IsForSale == true then
+		return "Yes"
+	elseif info.IsForSale == false then
+		return "No"
+	end
+	return missing
+end
+
+local function getButtonCenter(btn, flipInset)
+	local pos  = btn.AbsolutePosition
+	local size = btn.AbsoluteSize
+	local posX = pos.X + size.X / 2
+	local posY = pos.Y + size.Y / 2
+	local sg = btn:FindFirstAncestorWhichIsA("ScreenGui")
+	local needsInset = not (sg and sg.IgnoreGuiInset)
+	if flipInset then needsInset = not needsInset end
+	if needsInset then
+		posY = posY + GuiService:GetGuiInset().Y
+	end
+
+	local offset = _G.AutoPurchaseOffset
+	if typeof(offset) == "Vector2" then
+		posX, posY = posX + offset.X, posY + offset.Y
+	end
+
+	return posX, posY
+end
+
+local function isOnScreen(x, y)
+	local cam = workspace.CurrentCamera
+	if not cam then return true end
+	local vp = cam.ViewportSize
+	return x >= 0 and y >= 0 and x <= vp.X and y <= vp.Y + 100
+end
+
+local function showDebugDot(x, y, color)
+	if not _G.AutoPurchaseDebug then return end
+	pcall(function()
+		local gui = Instance.new("ScreenGui")
+		gui.Name = "ClickDebug"
+		gui.IgnoreGuiInset = true
+		gui.DisplayOrder = 2147483647
+		gui.Parent = CoreGui
+
+		local dot = Instance.new("Frame")
+		dot.Size = UDim2.fromOffset(12, 12)
+		dot.AnchorPoint = Vector2.new(0.5, 0.5)
+		dot.Position = UDim2.fromOffset(x, y)
+		dot.BackgroundColor3 = color or Color3.fromRGB(255, 0, 0)
+		dot.BorderSizePixel = 0
+		dot.Parent = gui
+		Instance.new("UICorner", dot).CornerRadius = UDim.new(1, 0)
+
+		task.delay(0.6, function() gui:Destroy() end)
+	end)
+end
+
+local function pointAt(btn, flipInset, color)
+	local x, y = getButtonCenter(btn, flipInset)
+	if not isOnScreen(x, y) then return nil end
+
+	showDebugDot(x, y, color)
+	VirtualInputManager:SendMouseMoveEvent(x, y, game)
+	task.wait()
+
+	local x2, y2 = getButtonCenter(btn, flipInset)
+	if math.abs(x2 - x) > 1 or math.abs(y2 - y) > 1 then
+		x, y = x2, y2
+		showDebugDot(x, y, color)
+		VirtualInputManager:SendMouseMoveEvent(x, y, game)
+		task.wait()
+	end
+	return x, y
+end
+
+local function clickAt(btn, flipInset, color)
+	local x, y = pointAt(btn, flipInset, color)
+	if not x then return end
+
+	VirtualInputManager:SendMouseButtonEvent(x, y, 0, true, game, 1)
+	task.wait()
+	VirtualInputManager:SendMouseButtonEvent(x, y, 0, false, game, 1)
+end
+
+local function clickByCoordinates(btn)
+	clickAt(btn, false, Color3.fromRGB(255, 0, 0))
+end
+
+local function clickByCoordinatesAlt(btn)
+	clickAt(btn, true, Color3.fromRGB(0, 120, 255))
+end
+
+local function clickByTouch(btn)
+	local x, y = getButtonCenter(btn, false)
+	if not isOnScreen(x, y) then return end
+
+	showDebugDot(x, y, Color3.fromRGB(255, 200, 0))
+	VirtualInputManager:SendTouchEvent(1, 0, x, y)
+	task.wait()
+	VirtualInputManager:SendTouchEvent(1, 2, x, y)
+end
+
+local function clickBySignal(btn)
+	local fired = false
+	for _, name in ipairs({ "Activated", "MouseButton1Click" }) do
+		if getconnections then
+			local okC, conns = pcall(getconnections, btn[name])
+			if okC and type(conns) == "table" then
+				for _, c in ipairs(conns) do
+					pcall(function()
+						if c.Fire then c:Fire() elseif c.Function then c.Function() end
+					end)
+					fired = true
+				end
+			end
+		end
+	end
+	if not fired and firesignal then
+		pcall(firesignal, btn.Activated)
+		pcall(firesignal, btn.MouseButton1Click)
+		fired = true
+	end
+	return fired
+end
+
+local function clickBySelection(btn)
+	local previous = GuiService.SelectedObject
+	GuiService.SelectedObject = btn
+	task.wait()
+	VirtualInputManager:SendKeyEvent(true, Enum.KeyCode.Return, false, game)
+	VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.Return, false, game)
+	task.wait()
+	GuiService.SelectedObject = previous
+end
+
+local CLICK_METHODS = { clickByCoordinates, clickByCoordinatesAlt, clickByTouch, clickBySignal, clickBySelection }
+
+local function isStillOpen(btn)
+	return btn ~= nil
+		and btn.Parent ~= nil
+		and btn:IsDescendantOf(CoreGui)
+		and btn.Visible
+		and btn.AbsoluteSize.X > 0
+end
+
+local function clickButton(btn, key)
+	local start = preferredMethod[key]
+	for i = 0, #CLICK_METHODS - 1 do
+		local idx = (start - 1 + i) % #CLICK_METHODS + 1
+		pcall(CLICK_METHODS[idx], btn)
+		task.wait(0.25)
+		if not isStillOpen(btn) then
+			preferredMethod[key] = idx
+			return true
+		end
+	end
+	return false
+end
+
+local function installStealthHooks()
+	if getgenv().AutoRefundStealthHooked then return end
+	getgenv().AutoRefundStealthHooked = true
+
+	pcall(function()
+		local mt = getrawmetatable(game)
+		setreadonly(mt, false)
+		local oldIndex, oldNamecall, oldToString = mt.__index, mt.__namecall, mt.__tostring
+
+		mt.__index = function(self, key)
+			if self == game and key == "VirtualInputManager" and not checkcaller() then return nil end
+			local value = oldIndex(self, key)
+			if type(value) == "function" then
+				return function(obj, ...)
+					local args = {...}
+					if (key == "WaitForChild" or key == "FindFirstChild" or key == "FindFirstChildRecursive" or key == "FindFirstChildOfClass" or key == "FindFirstChildWhichIsA") and args[1] == "VirtualInputManager" and not checkcaller() then return nil end
+					if key == "GetChildren" or key == "GetDescendants" then
+						local tbl = value(obj, ...)
+						local out = {}
+						for i = 1, #tbl do
+							local v = tbl[i]
+							if not (typeof(v) == "Instance" and v.Name == "VirtualInputManager") or checkcaller() then out[#out + 1] = v end
+						end
+						return out
+					end
+					local result = value(obj, ...)
+					if typeof(result) == "Instance" and result.Name == "VirtualInputManager" and not checkcaller() then return nil end
+					return result
+				end
+			end
+			if typeof(value) == "Instance" and value.Name == "VirtualInputManager" and not checkcaller() then return nil end
+			return value
+		end
+
+		mt.__namecall = function(self, ...)
+			local method = getnamecallmethod()
+			local args = {...}
+			if not checkcaller() then
+				if self == game and method == "GetService" and args[1] == "VirtualInputManager" then return nil end
+				if (method == "WaitForChild" or method == "FindFirstChild" or method == "FindFirstChildRecursive") and args[1] == "VirtualInputManager" then return nil end
+			end
+			local result = oldNamecall(self, ...)
+			if typeof(result) == "Instance" and result.Name == "VirtualInputManager" and not checkcaller() then return nil end
+			return result
+		end
+
+		mt.__tostring = function(self)
+			if typeof(self) == "Instance" and self.Name == "VirtualInputManager" and not checkcaller() then return "Instance" end
+			return oldToString(self)
+		end
+
+		local oldRawget
+		oldRawget = hookfunction(rawget, function(t, k)
+			if t == game and k == "VirtualInputManager" and not checkcaller() then return nil end
+			return oldRawget(t, k)
+		end)
+
+		local oldRawequal
+		oldRawequal = hookfunction(rawequal, function(a, b)
+			if not checkcaller() and ((typeof(a) == "Instance" and a.Name == "VirtualInputManager") or (typeof(b) == "Instance" and b.Name == "VirtualInputManager")) then return false end
+			return oldRawequal(a, b)
+		end)
+
+		setreadonly(mt, true)
+	end)
+end
+
+local function isButtonLoading(btn)
+	local gradient = btn:FindFirstChild("Gradient")
+	if not gradient then return false end
+	if gradient:IsA("UIGradient") then return gradient.Enabled end
+	return true
+end
+
+local function findCloseButton(overlay)
+	for _, d in ipairs(overlay:GetDescendants()) do
+		if d.Name == "CloseAffordance" and d:IsA("GuiButton") and d.Visible and d.AbsoluteSize.X > 0 then
+			return d
+		end
+	end
+	return nil
+end
+
+local function getPromptPrice(overlay)
+
+	local id = currentPromptId
+	if id then
+		local t = os.clock()
+		while itemCache[id] == nil and os.clock() - t < 0.5 do
+			task.wait()
+		end
+		local info = itemCache[id]
+		if info and type(info.Price) == "number" then return info.Price end
+	end
+
+	local cost = overlay:FindFirstChild("ItemCost", true) or overlay:FindFirstChild("RobuxPrice", true)
+	if cost and cost:IsA("TextLabel") then
+		local text = cleanRichText(cost.Text)
+		if string.find(string.lower(text), "free", 1, true) then return 0 end
+		local digits = text:gsub("[^%d]", "")
+		if digits ~= "" then return tonumber(digits) end
+	end
+	return nil
+end
+
+local targetCache = {}
+
+local function getTargetInfo(target)
+	local cached = targetCache[target]
+	if cached and (os.clock() - cached.at) < 30 then return cached.info end
+	local info = getProductInfo(target)
+	if info then targetCache[target] = { info = info, at = os.clock() } end
+	return info
+end
+
+local function matchesTarget(target)
+	local t = os.clock()
+	while currentPromptId == nil and os.clock() - t < 0.3 do
+		task.wait()
+	end
+
+	if currentPromptId ~= nil then
+		if currentPromptId == target then return true end
+		return false, "ID " .. tostring(currentPromptId) .. " does not match"
+	end
+
+	local targetInfo  = getTargetInfo(target)
+	local overlayInfo = getOverlayItemInfo()
+	if targetInfo and targetInfo.Name and overlayInfo and overlayInfo.Name then
+		if string.lower(overlayInfo.Name) == string.lower(targetInfo.Name) then
+			return true
+		end
+		return false, "item name does not match ID " .. tostring(target)
+	end
+
+	return false, "could not verify item ID"
+end
+
+local function shouldBuy(overlay)
+
+	if _G.AutoPurchaseFilter then
+		local target = tonumber(_G.AutoPurchaseId) or 0
+		if target ~= 0 then
+			local okMatch, reason = matchesTarget(target)
+			if not okMatch then return false, reason end
+		end
+	end
+
+	if _G.AutoPurchaseFreeOnly then
+		local price = getPromptPrice(overlay)
+		if price == nil then
+			return false, "could not determine the price"
+		elseif price ~= 0 then
+			return false, "price is " .. tostring(price) .. " Robux"
+		end
+	end
+
+	return true
+end
+
+local function closePrompt(overlay, reason)
+	local target = findCloseButton(overlay)
+	if not target then return end
+
+	lastActionAt = os.clock()
+	local why = tostring(reason or "conditions not met")
+	notifyOnce("close:" .. why, "Auto Purchase", "Skipped: " .. why, "info", 3)
+	local closedId = currentPromptId
+	clickButton(target, "close")
+	if currentPromptId == closedId then currentPromptId = nil end
+	lastActionAt = os.clock()
+end
+
+
+local function isHttpOk(res)
+	local code = res and (res.StatusCode or res.Status)
+	return code == 200 or code == 204
+end
+
+local function getJson(url)
+	if not Request then return nil end
+	local ok, res = pcall(Request, { Url = url, Method = "GET" })
+	if not ok or not isHttpOk(res) then return nil end
+
+	local decoded, data = pcall(HttpService.JSONDecode, HttpService, res.Body)
+	return decoded and data or nil
+end
+
+local function sendReport(messageText, itemName)
+	local webhook = _G.Webhook
+	if type(webhook) ~= "string" or webhook == "" or not Request then return end
+
+	local id = currentPromptId
+	if not id then
+		local typed = tonumber(_G.AutoPurchaseId) or 0
+		if typed ~= 0 then id = typed end
+	end
+	if not id then return end
+
+	local statusText = (cleanRichText(messageText):gsub("%s+", " "))
+	if statusText == "" then statusText = "Unknown" end
+
+	local key = statusText .. ":" .. tostring(id)
+	if lastReport.key == key and os.clock() - lastReport.at < 5 then return end
+	lastReport.key, lastReport.at = key, os.clock()
+
+	task.spawn(function()
+		local info = itemCache[id] or loadItemInfo(id)
+
+		local profile = getJson("https://users.roblox.com/v1/users/" .. LocalPlayer.UserId)
+		local displayName = profile and profile.displayName or LocalPlayer.Name
+
+		local thumb = getJson(
+			("https://thumbnails.roblox.com/v1/assets?assetIds=%d&size=420x420&format=Png&isCircular=false"):format(id)
+		)
+		local imageUrl = thumb and thumb.data and thumb.data[1] and thumb.data[1].imageUrl
+
+		local now = os.time()
+		local embed = {
+			title = "Report UGC Notification",
+			description = ("||script make by pnka.309||"),
+			color = 0xFFFFFF,
+			fields = {
+				{ name = "Account:", value = ("||%s (@%s) | %d||"):format(displayName, LocalPlayer.Name, LocalPlayer.UserId) },
+				{ name = "Item:", value = ("[%s](https://www.roblox.com/catalog/%d)"):format((tostring(itemName or info.Name or "Unknown"):gsub("[%[%]]", "")), id) },
+				{ name = "Id:",      value = tostring(id) },
+				{ name = "Price:",   value = info.Price ~= nil and (tostring(info.Price) .. " Robux") or "Unknown" },
+				{ name = "Status:",  value = "||" .. statusText .. "||" },
+				{ name = "Stock:",   value = formatStock(info, "N/A") },
+				{ name = "Serial:",  value = formatSerial(info, "N/A") },
+				{ name = "Onsale:",  value = formatSale(info, "N/A") },
+				{ name = "Limited:", value = formatLimited(info, "N/A") },
+				{ name = "\u{200B}", value = "▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬" },
+				{ name = "\u{200B}", value = ("<t:%d:D> | <t:%d:T>"):format(now, now) },
+			},
+			thumbnail = imageUrl and { url = imageUrl } or nil,
+		}
+
+		local ok, res = pcall(Request, {
+			Url     = webhook,
+			Method  = "POST",
+			Headers = { ["Content-Type"] = "application/json" },
+			Body    = HttpService:JSONEncode({ username = "i'm gay, ok?", embeds = { embed } }),
+		})
+
+		local sent = ok and isHttpOk(res)
+		notify("Webhook", sent and "Report sent" or "Report failed", sent and "success" or "error", 2)
+	end)
+end
+
+local function collapseSpaces(text)
+	text = tostring(text or ""):gsub("%s+", " ")
+	return (text:gsub("^ ", ""):gsub(" $", ""))
+end
+
+local function normalizeMessage(text)
+	return string.lower(collapseSpaces(text))
+end
+
+local function compileMessage(sentence)
+	local pattern = normalizeMessage(sentence)
+	pattern = pattern:gsub("[%^%$%(%)%%%.%[%]%*%+%-%?]", "%%%0")
+	pattern = pattern:gsub("{item_name}", "().+()")
+	return "^" .. pattern .. "$"
+end
+
+for _, entry in ipairs(SKIP_MESSAGES) do
+	entry.pattern = compileMessage(entry[1])
+	entry.hasName = string.find(string.lower(entry[1]), "{item_name}", 1, true) ~= nil
+end
+
+local function matchSkipMessage(text)
+	local collapsed = collapseSpaces(text)
+	local lowered   = string.lower(collapsed)
+
+	for _, entry in ipairs(SKIP_MESSAGES) do
+		if entry.hasName then
+			local from, to = string.match(lowered, entry.pattern)
+			if from then
+				return entry[2], entry[3], collapsed:sub(from, to - 1)
+			end
+		elseif string.find(lowered, entry.pattern) then
+			return entry[2], entry[3], nil
+		end
+	end
+	return nil
+end
+
+local function findSkipMessage(overlay)
+	local msg = overlay:FindFirstChild("Message", true)
+	if msg and msg:IsA("TextLabel") then
+		local label, status, itemName = matchSkipMessage(msg.Text)
+		if label then return label, status, msg.Text, itemName end
+	end
+
+	for _, d in ipairs(overlay:GetDescendants()) do
+		if d:IsA("TextLabel") and d.Text ~= "" then
+			local label, status, itemName = matchSkipMessage(d.Text)
+			if label then return label, status, d.Text, itemName end
+		end
+	end
+	return nil
+end
+
+local function handleSkipMessage(overlay)
+	if os.clock() - lastActionAt < 0.5 then return false end
+
+	local label, status, rawText, itemName = findSkipMessage(overlay)
+	if not label then
+		return false
+	end
+
+	local target = findCloseButton(overlay)
+	if not target then
+		for _, d in ipairs(overlay:GetDescendants()) do
+			if d.Name == "1" and d.Parent and d.Parent.Name == "Actions" and d:IsA("GuiButton") then
+				target = d
+				break
+			end
+		end
+	end
+
+	if target then
+		lastActionAt = os.clock()
+		local cached = currentPromptId and itemCache[currentPromptId]
+		local name   = itemName or (cached and cached.Name)
+		local text   = label
+		if name and name ~= "" then text = label .. "\n" .. name end
+		if status ~= "Success" and status ~= "Failed" then
+			text = "Skipped: " .. text
+		end
+		notifyOnce(
+			"skip:" .. tostring(status) .. ":" .. tostring(currentPromptId),
+			"Auto Purchase", text, STATUS_KIND[status] or "info", 3
+		)
+		sendReport(rawText, itemName)
+		local closedId = currentPromptId
+		clickButton(target, "close")
+		if currentPromptId == closedId then currentPromptId = nil end
+		lastActionAt = os.clock()
+	end
+	return true
+end
+
+local function scanOverlay(overlay)
+	if handleSkipMessage(overlay) then return end
+
+	local elements = overlay:GetDescendants()
+	for i = 1, #elements do
+		if not Runtime.alive then return end
+		local v = elements[i]
+		if v.Parent then
+			if v.Parent.Name == "1" and string.find(v.Name, "Buy") then
+
+				if os.clock() - lastActionAt >= 0.5 then
+					local lastPos = v.AbsolutePosition
+					task.wait(0.005)
+					if v.AbsolutePosition == lastPos and _G.AutoPurchase then
+						local okBuy, reason = shouldBuy(overlay)
+						if okBuy then
+							if not isButtonLoading(v) then
+								clickButton(v, "buy")
+							end
+						else
+							closePrompt(overlay, reason)
+						end
+					end
+				end
+
+			elseif v.Parent.Name == "Actions" and v.Name == "1" then
+
+				local isBuyBtn = false
+				local children = v.Parent:GetDescendants()
+				for j = 1, #children do
+					local child = children[j]
+					if child:IsA("TextLabel") and (string.find(child.Text, "Buy") or string.find(child.Text, "Price") or string.find(child.Text, "Robux")) then
+						isBuyBtn = true
+						break
+					end
+				end
+
+				if not isBuyBtn then
+					local lastPos = v.AbsolutePosition
+					task.wait()
+					if v.AbsolutePosition == lastPos and _G.AutoPurchase then
+						clickButton(v, "buy")
+					end
+				end
+			end
+		end
+	end
+end
+
+table.insert(Runtime.connections, MarketplaceService.PromptPurchaseRequestedV2:Connect(function(_, assetId)
+	if not assetId or assetId == 0 then return end
+
+	currentPromptId = assetId
+	itemCache[assetId] = nil
+
+	local autoDecline = _G.AutoRefundV2 and not _G.AutoPurchase
+
+	local info = loadItemInfo(assetId)
+
+	local status = "N/A"
+	if info.IsForSale == true then
+		status = "On Sale"
+	elseif info.IsForSale == false then
+		status = "Off Sale"
+	end
+
+	notify(
+		"Item Profile",
+		string.format(
+			"%s\n%s | %s\nLeft: %s | Serial: %s",
+			info.Name or "Unknown Item",
+			info.Price ~= nil and (tostring(info.Price) .. " Robux") or "?",
+			status,
+			formatStock(info, "N/A"),
+			formatSerial(info, "N/A")
+		),
+		"info",
+		10,
+		"rbxthumb://type=Asset&id=" .. tostring(assetId) .. "&w=420&h=420"
+	)
+
+	if autoDecline then
+		pcall(function()
+			MarketplaceService:SignalPromptPurchaseFinished(LocalPlayer, assetId, false)
+		end)
+		notifyOnce("decline:" .. tostring(assetId), "Auto Refund", "Declined: " .. tostring(info.Name or assetId), "info", 3)
+	end
+end))
+
+task.spawn(function()
+	local lastState = _G.AutoPurchase and true or false
+
+	while Runtime.alive do
+		local state = _G.AutoPurchase and true or false
+
+		if state ~= lastState then
+			notify("Auto Purchase", state and "Enabled" or "Disabled", state and "success" or "info", 3)
+			lastState = state
+		end
+
+		if state then
+			if _G.AutoPurchaseStealth then installStealthHooks() end
+			local overlay = CoreGui:FindFirstChild("FoundationOverlay")
+			if overlay then
+				pcall(scanOverlay, overlay)
+			end
+		end
+
+		task.wait()
+	end
+end)
+
+local function buildUI()
+	local okLib, Library = pcall(function()
+		return loadstring(game:HttpGet(URL_WALLYLIB, true))()
+	end)
+	if not okLib or type(Library) ~= "table" then
+		notify("Load Error", "Failed to load UI library.", "error", 8)
+		return
+	end
+
+	local win = Library:CreateWindow("universal v1")
+	Runtime.library = Library
+	Runtime.gui = win.object and win.object:FindFirstAncestorWhichIsA("ScreenGui") or nil
+
+	local itemLabel
+	local idBox
+
+	local function setItemLabel(info, id)
+		info = info or {}
+
+		local text = "Name: " .. tostring(info.Name or "nil")
+			.. "\nID: " .. tostring(id or "nil")
+			.. "\nSale: " .. formatSale(info, "nil")
+			.. "\nRobux: " .. formatPrice(info, "nil")
+			.. "\nStock: " .. formatStock(info, "nil")
+			.. "\nSerial: " .. formatSerial(info, "nil")
+			.. "\nLimited: " .. formatLimited(info, "nil")
+
+		itemLabel:Set(text)
+
+		task.delay(0.15, function() itemLabel:Set(text) end)
+	end
+
+	local function refreshItem()
+		local id = tonumber(_G.AutoPurchaseId) or 0
+		if id == 0 then
+			setItemLabel(nil, nil)
+			return
+		end
+
+		task.spawn(function()
+			local info = loadItemInfo(id)
+
+			if (tonumber(_G.AutoPurchaseId) or 0) ~= id then return end
+
+			if info.Name ~= nil then
+				setItemLabel(info, id)
+			else
+				setItemLabel(nil, nil)
+			end
+		end)
+	end
+
+	win:Section("Main")
+
+	win:Toggle("Auto Refund", { default = _G.AutoRefundV2 == true, flag = "AutoRefund" }, function(state)
+		_G.AutoRefundV2 = state
+		saveSettings()
+		notify("Auto Refund", state and "Enabled - prompts will be declined" or "Disabled", state and "success" or "info", 3)
+	end)
+
+	win:Toggle("Auto Purchase", { default = _G.AutoPurchase == true, flag = "AutoPurchase" }, function(state)
+		_G.AutoPurchase = state
+		saveSettings()
+	end)
+
+	idBox = win:Box("Item ID", { flag = "AutoPurchaseIdBox" }, function(value)
+		local id = parseItemId(value)
+		_G.AutoPurchaseId = id
+		saveSettings()
+		idBox.Text = id ~= 0 and tostring(id) or ""
+		refreshItem()
+		remindUntil(
+			"filter",
+			'pls turn on "Only buy matching ID"',
+			function() return _G.AutoPurchaseFilter == true end,
+			function() return (tonumber(_G.AutoPurchaseId) or 0) ~= 0 end
+		)
+	end)
+	if (tonumber(_G.AutoPurchaseId) or 0) ~= 0 then
+		idBox.Text = tostring(_G.AutoPurchaseId)
+	end
+
+	itemLabel = win:Label("Name: nil\nID: nil\nSale: nil\nRobux: nil\nStock: nil\nSerial: nil\nLimited: nil", { wrap = true })
+	refreshItem()
+
+	win:Toggle("Only buy matching ID", { default = _G.AutoPurchaseFilter == true, flag = "AutoPurchaseFilter" }, function(state)
+		_G.AutoPurchaseFilter = state
+		saveSettings()
+		remindUntil(
+			"purchase",
+			'pls turn on "Auto Purchase"',
+			function() return _G.AutoPurchase == true end,
+			function() return _G.AutoPurchaseFilter == true or _G.AutoPurchaseFreeOnly == true end
+		)
+	end)
+
+	win:Toggle("Only buy if price is 0 Robux", { default = _G.AutoPurchaseFreeOnly == true, flag = "AutoPurchaseFreeOnly" }, function(state)
+		_G.AutoPurchaseFreeOnly = state
+		saveSettings()
+		remindUntil(
+			"purchase",
+			'pls turn on "Auto Purchase"',
+			function() return _G.AutoPurchase == true end,
+			function() return _G.AutoPurchaseFilter == true or _G.AutoPurchaseFreeOnly == true end
+		)
+	end)
+
+	win:Button("Destroy", function()
+		for _, entry in ipairs(SETTINGS) do
+			_G[entry[2]] = nil
+		end
+		notify("pnka", "Destroyed", "info", 2)
+		Runtime.Destroy()
+	end)
+
+	win:Label("Credit: skid by pnka.309")
+end
+
+buildUI()
+
+notify("universal v1", "script successfully loaded\nenjoy!", "info", 5)
